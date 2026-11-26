@@ -20,6 +20,7 @@ def _():
     import json
     import math
     import os
+    import queue
     import random
     import re
     import shlex
@@ -30,6 +31,7 @@ def _():
     import subprocess
     import sys
     import tarfile
+    import threading
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from datetime import datetime
@@ -232,7 +234,8 @@ def _():
         return out.strip(), had, leak
 
 
-    def analyze(raw, min_quotes, finish):
+    def analyze(raw, min_quotes, finish, think_tokens=0):
+        """think_tokens = token thinking (dari reasoning_content / blok think) untuk deteksi THINK_RUNAWAY."""
         text, had_thinking, think_leak = clean_text(raw)
         t = text.translate(QUOTE_MAP).replace("*", "")
         empty = len(t.strip()) < 20
@@ -277,6 +280,8 @@ def _():
         rep = 1 - len(set(grams)) / len(grams) if len(grams) >= 40 else 0.0
         loop = rep > 0.25
         truncated = finish == "length"
+        # token habis di thinking sebelum jawaban selesai
+        think_runaway = truncated and (had_thinking or (think_tokens or 0) > 0) and (empty or n_q < min_quotes)
 
         fmt = 3.0 * pair_ratio * min(1.0, n_q / max(1, min_quotes))
         de_s = 2.0 * de_frac
@@ -302,7 +307,7 @@ def _():
             "flags": [f for f, on in (("REFUSAL", refusal), ("LECTURE", lecture), ("THINK_LEAK", think_leak),
                                       ("LOOP", loop), ("TRUNCATED", truncated), ("EMPTY", empty),
                                       ("FRAGMENTED", fragmented), ("NARRATION_NOT_ID", narr_bad),
-                                      ("DIALOG_NOT_DE", dial_bad)) if on],
+                                      ("DIALOG_NOT_DE", dial_bad), ("THINK_RUNAWAY", think_runaway)) if on],
             "had_thinking": had_thinking, "repetition": round(rep, 2),
         }
 
@@ -348,7 +353,15 @@ def _():
             "top_p": model.get("top_p", args.top_p),
             "max_tokens": model.get("max_tokens", args.max_tokens), "seed": seed,
         }
-        body.update(model.get("extra", {}))
+        extra = dict(model.get("extra", {}))
+        think = getattr(args, "thinking", None)
+        if think is not None and model.get("launch"):
+            # hanya untuk server lokal (llama.cpp --jinja); API luar bisa menolak field ini.
+            # chat_template_kwargs di "extra" model tetap menang (override per model).
+            ctk = {"enable_thinking": bool(think)}
+            ctk.update(extra.pop("chat_template_kwargs", None) or {})
+            body["chat_template_kwargs"] = ctk
+        body.update(extra)
         headers = {"Content-Type": "application/json"}
         key = model.get("api_key") or os.environ.get(model.get("api_key_env", ""), "")
         if key:
@@ -359,8 +372,37 @@ def _():
         dt = time.time() - t0
         data = r.json()
         ch = data["choices"][0]
-        return {"text": ch["message"].get("content") or "", "finish": ch.get("finish_reason"),
-                "latency": dt, "tokens": (data.get("usage") or {}).get("completion_tokens")}
+        msg = ch.get("message") or {}
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+        return {"text": msg.get("content") or "", "finish": ch.get("finish_reason"),
+                "latency": dt, "tokens": (data.get("usage") or {}).get("completion_tokens"),
+                "reasoning": reasoning}
+
+
+    def count_tokens(model, text):
+        """Hitung token lewat endpoint /tokenize llama-server. None kalau tidak tersedia (API luar, mock)."""
+        base = str(model.get("base_url", ""))
+        if not model.get("launch") or not base.startswith("http") or not text:
+            return 0 if not text else None
+        root = re.sub(r"/v1/?$", "", base.rstrip("/"))
+        try:
+            r = requests.post(root + "/tokenize", json={"content": text}, timeout=60)
+            r.raise_for_status()
+            return len(r.json().get("tokens", []))
+        except Exception:  # noqa
+            return None
+
+
+    def think_token_count(model, r, cleaned):
+        """Token thinking = completion_tokens - token jawaban. Fallback: perkiraan 4 karakter/token."""
+        raw = r.get("text") or ""
+        inline = max(0, len(raw) - len(cleaned)) if raw != cleaned else 0
+        rchars = len(r.get("reasoning") or "") + inline
+        if r.get("tokens"):
+            ct = count_tokens(model, cleaned)
+            if ct is not None:
+                return max(0, r["tokens"] - ct), True
+        return round(rchars / 4), False
 
 
     def run_scene(model, scene, run_idx, args):
@@ -371,9 +413,11 @@ def _():
             messages.append({"role": "user", "content": user})
             r = chat(model, messages, args, seed=args.seed + run_idx)
             cleaned, _, _ = clean_text(r["text"])
-            a = analyze(r["text"], scene.get("min_quotes", 3), r["finish"])
+            think_tok, exact = think_token_count(model, r, cleaned)
+            a = analyze(r["text"], scene.get("min_quotes", 3), r["finish"], think_tok)
             turns.append({"turn": i + 1, "user": user, "output": cleaned, "finish": r["finish"],
-                          "latency": round(r["latency"], 2), "tokens": r["tokens"], "analysis": a})
+                          "latency": round(r["latency"], 2), "tokens": r["tokens"],
+                          "think_tokens": think_tok, "think_exact": exact, "analysis": a})
             messages.append({"role": "assistant", "content": cleaned})
         return {"scene": scene["id"], "run": run_idx, "turns": turns}
 
@@ -538,8 +582,9 @@ def _():
             return s.getsockname()[1]
 
 
-    def build_cmd(launch, port, exe=None, model_path=None, parallel=1):
-        """parallel = jumlah slot llama-server; konteks total = ctx x parallel supaya tiap slot tetap dapat ctx penuh."""
+    def build_cmd(launch, port, exe=None, model_path=None, parallel=1, extra_args=None):
+        """parallel = jumlah slot llama-server; konteks total = ctx x parallel supaya tiap slot tetap dapat ctx penuh.
+        extra_args = flag dari form (reasoning budget, KV cache); launch["args"] dipasang terakhir supaya menang."""
         backend = launch.get("backend", "llama.cpp")
         if backend == "llama.cpp":
             ctx = int(launch.get("ctx", 32768))
@@ -552,7 +597,7 @@ def _():
             # repo Gemma 4 menyertakan mmproj (vision, ~1.2GB); tes teks tidak butuh
             if not model_path and not launch.get("mmproj", False):
                 cmd.append("--no-mmproj")
-            return cmd + [str(x) for x in launch.get("args", [])]
+            return cmd + [str(x) for x in (extra_args or [])] + [str(x) for x in launch.get("args", [])]
         if backend == "command":
             return shlex.split(launch["cmd"].format(port=port))
         raise ValueError(f"backend tidak dikenal: {backend} (pakai 'llama.cpp' atau 'command')")
@@ -592,6 +637,10 @@ def _():
             return None
 
 
+    # satu unduhan sekaligus: Xet sudah memenuhi bandwidth, dan cek disk tidak balapan antar thread
+    _DL_LOCK = threading.Lock()
+
+
     def fetch_gguf(model, log=print):
         """Unduh GGUF lewat huggingface_hub (Xet, mode high-performance, pakai HF_TOKEN dari Secrets).
         Return path file GGUF pertama. Disimpan di folder cache model, dihapus setelah model selesai dites."""
@@ -600,14 +649,20 @@ def _():
         la = model["launch"]
         dest = model_cache_dir(model["name"]) / "gguf"
         dest.mkdir(parents=True, exist_ok=True)
-        need, free = gguf_size_gb(model), disk_free_gb(dest)
-        have = sum(f.stat().st_size for f in dest.rglob("*") if f.is_file()) / 1e9  # sisa unduhan sebelumnya
-        if need and free is not None and free < need - have + 2:
-            raise OSError(f"Disk tidak cukup untuk {model['name']}: butuh {need} GB, kosong {free} GB")
-        t0 = time.time()
-        log(f"Mengunduh {la['hf']}/{la['hf_file']} ...")
-        snapshot_download(la["hf"], allow_patterns=_gguf_patterns(la["hf_file"]), local_dir=str(dest),
-                          token=os.environ.get("HF_TOKEN") or None)
+        if not _DL_LOCK.acquire(blocking=False):
+            log("Menunggu unduhan lain selesai ...")
+            _DL_LOCK.acquire()
+        try:
+            need, free = gguf_size_gb(model), disk_free_gb(dest)
+            have = sum(f.stat().st_size for f in dest.rglob("*") if f.is_file()) / 1e9  # sisa unduhan sebelumnya
+            if need and free is not None and free < need - have + 2:
+                raise OSError(f"Disk tidak cukup untuk {model['name']}: butuh {need} GB, kosong {free} GB")
+            t0 = time.time()
+            log(f"Mengunduh {la['hf']}/{la['hf_file']} ...")
+            snapshot_download(la["hf"], allow_patterns=_gguf_patterns(la["hf_file"]), local_dir=str(dest),
+                              token=os.environ.get("HF_TOKEN") or None)
+        finally:
+            _DL_LOCK.release()
         files = sorted(dest.rglob("*.gguf"))
         if not files:
             raise FileNotFoundError(f"{la['hf_file']} tidak ada di {la['hf']}")
@@ -618,7 +673,7 @@ def _():
                         files[0]))
 
 
-    def start_server(launch, port, name, exe=None, model_path=None, parallel=1):
+    def start_server(launch, port, name, exe=None, model_path=None, parallel=1, extra_args=None):
         WORK_DIR.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^\w.-]+", "_", name)
         cache_dir = model_cache_dir(name)
@@ -630,7 +685,8 @@ def _():
         if libs:
             env["LD_LIBRARY_PATH"] = ":".join(libs + [env.get("LD_LIBRARY_PATH", "")]).strip(":")
         with open(log_path, "wb") as lf:
-            proc = subprocess.Popen(build_cmd(launch, port, exe, model_path, parallel), stdout=lf, stderr=subprocess.STDOUT,
+            proc = subprocess.Popen(build_cmd(launch, port, exe, model_path, parallel, extra_args),
+                                    stdout=lf, stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL, env=env, start_new_session=True)
         return proc, log_path, cache_dir
 
@@ -642,6 +698,87 @@ def _():
             return lines[-1][:maxlen] if lines else ""
         except Exception:
             return ""
+
+
+    def _tail_text(path, n=6000):
+        try:
+            return Path(path).read_bytes()[-n:].decode("utf-8", "ignore")
+        except Exception:
+            return ""
+
+
+    def vram_free_gb():
+        """VRAM kosong GPU pertama (GB) dari nvidia-smi. None kalau tidak terbaca."""
+        rc, out = _sh(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        if rc != 0:
+            return None
+        try:
+            return round(float(out.strip().splitlines()[0]) / 1024, 1)
+        except Exception:  # noqa
+            return None
+
+
+    class GpuGate:
+        """Mengatur berapa model yang boleh dimuat bersamaan di satu GPU.
+        Model berikutnya baru dimuat kalau semua model yang jalan sudah siap DAN VRAM kosong cukup.
+        Kebutuhan VRAM diperkirakan dari pemakaian nyata model yang sudah jalan (bobot + KV cache),
+        diskalakan dengan ukuran GGUF. Tanpa nvidia-smi: selalu bergantian."""
+
+        def __init__(self, slots=1, margin_gb=3.0):
+            self.slots, self.margin = max(1, int(slots)), margin_gb
+            self.cv = threading.Condition()
+            self.running = {}  # name -> [ukuran GGUF GB, VRAM terpakai GB atau None selagi memuat]
+
+        def acquire(self, name, size_gb, exclusive=False, log=print):
+            told = False
+            with self.cv:
+                while self.running:
+                    note = None
+                    if not exclusive and len(self.running) < self.slots and \
+                            all(v[1] is not None for v in self.running.values()):
+                        free = vram_free_gb()
+                        ratio = max(v[1] / v[0] for v in self.running.values() if v[0]) if self.running else 1.4
+                        need = size_gb * ratio + self.margin
+                        if free is not None and free >= need:
+                            break
+                        note = f"menunggu VRAM: kosong {free} GB, perlu ~{need:.0f} GB"
+                    if not told:
+                        log(note or ("menunggu model lain selesai (dimuat sendirian)" if exclusive
+                                     else "menunggu giliran GPU"))
+                        told = True
+                    self.cv.wait(timeout=20)
+                self.running[name] = [size_gb, None]
+
+        def loaded(self, name, free_before):
+            free_after = vram_free_gb()
+            with self.cv:
+                if name in self.running:
+                    used = free_before - free_after if free_before is not None and free_after is not None else None
+                    self.running[name][1] = used if used and used > 0 else self.running[name][0] * 1.4
+                self.cv.notify_all()
+
+        def release(self, name):
+            with self.cv:
+                self.running.pop(name, None)
+                self.cv.notify_all()
+
+        def others(self, name):
+            with self.cv:
+                return [n for n in self.running if n != name]
+
+
+    def server_args(args, budget=None, kv=None):
+        """Flag llama-server dari form: thinking (--reasoning-budget) dan KV cache q8_0.
+        Dicek di README llama-server (Nov 2026): `-fa on|off|auto` dan `--reasoning-budget N` (N>0 = batas token)."""
+        out = []
+        think = getattr(args, "thinking", None)
+        if think is not None:
+            b = getattr(args, "reasoning_budget", -1) if budget is None else budget
+            out += ["--reasoning-budget", str(int(b) if think else 0)]
+        if getattr(args, "kv_q8", False) if kv is None else kv:
+            # V cache terkuantisasi butuh flash attention
+            out += ["-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on"]
+        return out
 
 
     def wait_ready(proc, port, log_path, timeout=3600, log=print):
@@ -700,16 +837,29 @@ def _():
         return out
 
 
+    def _files_gb(path):
+        try:
+            p = Path(path)
+            files = list(p.parent.glob(_SPLIT_RE.sub("-*-of-*.gguf", p.name))) if _SPLIT_RE.search(p.name) else [p]
+            return round(sum(f.stat().st_size for f in files) / 1e9, 1)
+        except Exception:  # noqa
+            return None
+
+
     def execute_model(model, scenes, runs, args, log=print, step=None, keep_cache=False, ready_timeout=3600,
-                      on_variant_done=None, model_path=None):
+                      on_variant_done=None, model_path=None, gate=None):
         """Jalankan semua scene (x semua varian) untuk satu model. Return list payload, satu per varian.
         Kalau model punya "launch", GGUF diunduh (kecuali model_path sudah diberikan dari prefetch), server
         dinyalakan sekali, lalu dimatikan dan cache dihapus sehingga GPU & disk bersih untuk model berikutnya.
-        (scene, run) dijalankan paralel sebanyak args.parallel (= slot llama-server)."""
+        (scene, run) dijalankan paralel sebanyak args.parallel (= slot llama-server).
+        gate = GpuGate kalau beberapa model boleh jalan bersamaan di satu GPU."""
         launch = model.get("launch")
         # "parallel" di launch (mis. model 119B yang memenuhi VRAM) mengalahkan setelan form
         par = max(1, int((launch or {}).get("parallel", getattr(args, "parallel", 1))))
         proc = None
+        held = False
+        budget_used = getattr(args, "reasoning_budget", None)
+        kv_ok = False
         cache_dir = model_cache_dir(model["name"]) if launch else None
         try:
             server = {}
@@ -718,10 +868,52 @@ def _():
                 exe = ensure_llama_server(log) if is_llama else None
                 if is_llama and model_path is None and can_prefetch(model):
                     model_path = fetch_gguf(model, log)
-                port = _free_port()
-                log(f"Memuat {model['name']} ke GPU ({par} slot paralel)...")
-                proc, log_path, cache_dir = start_server(launch, port, model["name"], exe, model_path, par)
-                wait_ready(proc, port, log_path, ready_timeout, log)
+                if is_llama:
+                    # ctx per slot harus muat prompt + riwayat + max_tokens (thinking ikut dihitung)
+                    mt = max(int(c.get("max_tokens", args.max_tokens)) for c in expand_variants(model))
+                    launch = {**launch, "ctx": max(int(launch.get("ctx", 32768)), mt + 8192)}
+                size = (_files_gb(model_path) if model_path else None) or gguf_size_gb(model) or 30.0
+                alone = False      # True = ulang sendirian setelah gagal memuat di samping model lain
+                retried_budget = False
+                kv_ok = bool(getattr(args, "kv_q8", False))
+                while True:
+                    if gate:
+                        gate.acquire(model["name"], size, exclusive=alone, log=log)
+                        held = True
+                    free0 = vram_free_gb()
+                    port = _free_port()
+                    log(f"Memuat {model['name']} ke GPU ({par} slot, ctx/slot {launch.get('ctx', '-')})...")
+                    xargs = server_args(args, budget_used, kv=kv_ok) if is_llama else None
+                    proc, log_path, cache_dir = start_server(launch, port, model["name"], exe, model_path, par, xargs)
+                    try:
+                        wait_ready(proc, port, log_path, ready_timeout, log)
+                        if gate:
+                            gate.loaded(model["name"], free0)
+                        break
+                    except Exception:
+                        stop_server(proc)
+                        proc = None
+                        tail = _tail_text(log_path).lower()
+                        others = gate.others(model["name"]) if gate else []
+                        if gate:
+                            gate.release(model["name"])
+                            held = False
+                        # llama-server lama hanya menerima --reasoning-budget -1 atau 0
+                        if is_llama and getattr(args, "thinking", None) and budget_used not in (-1, 0, None) \
+                                and not retried_budget and "reasoning" in tail:
+                            log(f"--reasoning-budget {budget_used} ditolak, ulang dengan -1 (tanpa batas)")
+                            budget_used, retried_budget = -1, True
+                            continue
+                        # binary lama: -fa tanpa nilai / cache type q8_0 tidak didukung
+                        if is_llama and kv_ok and any(k in tail for k in ("flash", "-fa", "cache-type", "ctk", "ctv")):
+                            log("KV cache q8_0 / flash attention ditolak, ulang dengan KV f16")
+                            kv_ok = False
+                            continue
+                        if others and not alone:
+                            log(f"Gagal memuat di samping {', '.join(others)} (VRAM?), ulang sendirian")
+                            alone = True
+                            continue
+                        raise
                 server = {"base_url": f"http://127.0.0.1:{port}/v1"}
             payloads = []
             for cfg in expand_variants(model):
@@ -752,7 +944,12 @@ def _():
                                   "top_p": cfg.get("top_p", args.top_p),
                                   "max_tokens": cfg.get("max_tokens", args.max_tokens),
                                   "extra": cfg.get("extra", {}), "launch": launch, "seed": args.seed,
-                                  "parallel": par,
+                                  "parallel": par, "runs": runs,
+                                  "thinking": getattr(args, "thinking", None),
+                                  "reasoning_budget": getattr(args, "reasoning_budget", None),
+                                  "reasoning_budget_used": budget_used,
+                                  "kv_q8": getattr(args, "kv_q8", False),
+                                  "kv_q8_used": kv_ok,
                                   "finished": datetime.now().isoformat(timespec="seconds")}}
                 payloads.append(p)
                 if on_variant_done:
@@ -761,6 +958,8 @@ def _():
         finally:
             if proc is not None:
                 stop_server(proc)
+            if gate and held:
+                gate.release(model["name"])
             if cache_dir is not None and not keep_cache:
                 shutil.rmtree(cache_dir, ignore_errors=True)
 
@@ -774,25 +973,30 @@ def _():
             self.keep_cache = keep_cache
             self.pool = ThreadPoolExecutor(max_workers=1)  # satu per satu: Xet sudah memenuhi bandwidth
             self.futs = {}  # idx -> (future, ukuran GB)
+            self.claimed = set()  # model yang sudah diambil pekerja (jangan di-prefetch lagi)
+            self.lock = threading.Lock()  # dipanggil dari beberapa thread pekerja
 
         def schedule(self, current):
-            for j in range(current + 1, min(len(self.models), current + 1 + self.depth)):
-                m = self.models[j]
-                if j in self.futs or not can_prefetch(m):
-                    continue
-                size = gguf_size_gb(m) or 40.0
-                pending = sum(s for f, s in self.futs.values() if not f.done())
-                free = disk_free_gb() or 0.0
-                if free - pending < size + self.margin:
-                    self.log(f"Prefetch {m['name']} ditunda: disk kosong {free} GB, butuh {size} GB + cadangan")
-                    break  # dicoba lagi setelah model sekarang selesai dan cache-nya dihapus
-                self.futs[j] = (self.pool.submit(fetch_gguf, m, lambda *_: None), size)
+            with self.lock:
+                for j in range(current + 1, min(len(self.models), current + 1 + self.depth)):
+                    m = self.models[j]
+                    if j in self.futs or j in self.claimed or not can_prefetch(m):
+                        continue
+                    size = gguf_size_gb(m) or 40.0
+                    pending = sum(s for f, s in self.futs.values() if not f.done())
+                    free = disk_free_gb() or 0.0
+                    if free - pending < size + self.margin:
+                        self.log(f"Prefetch {m['name']} ditunda: disk kosong {free} GB, butuh {size} GB + cadangan")
+                        break  # dicoba lagi setelah model sekarang selesai dan cache-nya dihapus
+                    self.futs[j] = (self.pool.submit(fetch_gguf, m, lambda *_: None), size)
 
         def take(self, idx):
             """Path GGUF hasil prefetch untuk model idx (menunggu kalau belum selesai), atau None."""
-            if idx not in self.futs:
-                return None
-            f, _ = self.futs.pop(idx)
+            with self.lock:
+                self.claimed.add(idx)
+                if idx not in self.futs:
+                    return None
+                f, _ = self.futs.pop(idx)
             if not f.done():
                 self.log(f"Menunggu unduhan {self.models[idx]['name']} selesai ...")
             try:
@@ -803,11 +1007,12 @@ def _():
 
         def close(self):
             self.pool.shutdown(wait=False, cancel_futures=True)
-            if not self.keep_cache:
-                for j, (f, _) in self.futs.items():
-                    if f.done():
-                        shutil.rmtree(model_cache_dir(self.models[j]["name"]), ignore_errors=True)
-            self.futs.clear()
+            with self.lock:
+                if not self.keep_cache:
+                    for j, (f, _) in self.futs.items():
+                        if f.done():
+                            shutil.rmtree(model_cache_dir(self.models[j]["name"]), ignore_errors=True)
+                self.futs.clear()
 
 
     def disk_free_gb(path=None):
@@ -820,6 +1025,98 @@ def _():
             return None
 
 
+    def payload_matches(p, runs, scene_ids, want):
+        """Hasil lama boleh dilewati kalau setelannya sama dan semua (scene, run) lengkap tanpa error."""
+        s = p.get("settings") or {}
+        if any(s.get(k) != v for k, v in want.items()):
+            return False
+        if any("error" in r for r in p.get("results", [])):
+            return False
+        have = {(r.get("scene"), r.get("run")) for r in p.get("results", []) if r.get("turns")}
+        return all((sc, i) in have for sc in scene_ids for i in range(runs))
+
+
+    def already_done(model, known, runs, scene_ids, args):
+        """True kalau SEMUA varian model ini sudah ada di `known` dengan setelan yang sama."""
+        for cfg in expand_variants(model):
+            p = known.get(cfg["name"])
+            want = {"max_tokens": cfg.get("max_tokens", args.max_tokens),
+                    "thinking": getattr(args, "thinking", None),
+                    "reasoning_budget": getattr(args, "reasoning_budget", None)}
+            if not p or not payload_matches(p, runs, scene_ids, want):
+                return False
+        return True
+
+
+    def run_batch(models, scenes, runs, args, concurrency=1, prefetch=1, keep_cache=False, push=None):
+        """Jalankan banyak model, sampai `concurrency` model sekaligus di satu GPU (diatur GpuGate).
+        Generator: event di-yield dari thread pemanggil, jadi aman dipakai untuk update UI marimo.
+        Event: ("log", model, teks), ("step", model, varian, label), ("variant", payload, info_unggah),
+        ("done", model, berhasil, info)."""
+        q = queue.Queue()
+        conc = max(1, int(concurrency))
+        gate = GpuGate(conc) if conc > 1 else None
+        # dengan beberapa pekerja, model idx+1 langsung diambil pekerja lain: prefetch perlu melihat lebih jauh
+        depth = int(prefetch) + conc - 1 if int(prefetch) > 0 else 0
+        pf = Prefetcher(models, depth=depth, keep_cache=keep_cache, log=lambda m: q.put(("log", "prefetch", str(m))))
+
+        def worker(idx, m):
+            base = m["name"]
+
+            def log(msg):
+                q.put(("log", base, str(msg)))
+
+            def step(name, scene, i, res):
+                q.put(("step", base, name, f"{scene} run{i + 1}"))
+
+            def vdone(p):
+                info = None
+                if push:
+                    try:
+                        info = push(p)
+                    except Exception as e:  # noqa
+                        info = f"Gagal unggah HF ({p['name']}): {type(e).__name__}: {e}"
+                q.put(("variant", p, info))
+
+            try:
+                path = pf.take(idx)
+                if path is None and can_prefetch(m):
+                    path = fetch_gguf(m, log)
+                pf.schedule(idx)
+                ps = execute_model(m, scenes, runs, args, log=log, step=step, keep_cache=keep_cache,
+                                   ready_timeout=3600, on_variant_done=vdone, model_path=path, gate=gate)
+                return True, ", ".join(p["name"] for p in ps)
+            except Exception as e:  # noqa
+                if not keep_cache:
+                    shutil.rmtree(model_cache_dir(base), ignore_errors=True)
+                return False, f"{type(e).__name__}: {e}"[:300]
+
+        def drain():
+            while True:
+                try:
+                    yield q.get_nowait()
+                except queue.Empty:
+                    return
+
+        try:
+            with ThreadPoolExecutor(max_workers=conc) as ex:
+                futs = {ex.submit(worker, i, m): m["name"] for i, m in enumerate(models)}
+                pending = set(futs)
+                while pending:
+                    try:
+                        yield q.get(timeout=0.5)
+                    except queue.Empty:
+                        pass
+                    for f in [f for f in pending if f.done()]:
+                        pending.discard(f)
+                        yield from drain()  # event pekerja ini selalu masuk antrean sebelum ia selesai
+                        ok, info = f.result()
+                        yield ("done", futs[f], ok, info)
+                yield from drain()
+        finally:
+            pf.close()
+
+
     # --------------------------------------------------------------------------------------
     # Penyimpanan hasil antar sesi
     # Molab menghapus file buatan kode saat notebook mati (hanya source, upload lewat file browser,
@@ -830,12 +1127,17 @@ def _():
         return re.sub(r"[^\w.@-]+", "_", name)
 
 
+    # folder di dataset HF. Run lama (max_tokens 1200, thinking campur) ada di "results/"; run baru dipisah
+    # supaya tidak tertimpa atau tercampur. Ganti lewat secret RP_HF_RESULTS_DIR.
+    HF_RESULTS_DIR = os.environ.get("RP_HF_RESULTS_DIR", "results_think16k").strip("/") or "results"
+
+
     def hf_results_enabled():
         return bool(os.environ.get("RP_HF_RESULTS_REPO") and os.environ.get("HF_TOKEN"))
 
 
     def hf_push_payload(payload):
-        """Unggah satu payload varian ke results/<name>.json di dataset HF privat. Return path atau None."""
+        """Unggah satu payload varian ke <HF_RESULTS_DIR>/<name>.json di dataset HF privat. Return path atau None."""
         if not hf_results_enabled():
             return None
         from huggingface_hub import HfApi
@@ -843,7 +1145,7 @@ def _():
         repo = os.environ["RP_HF_RESULTS_REPO"]
         api = HfApi(token=os.environ["HF_TOKEN"])
         api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
-        path = f"results/{_safe(payload['name'])}.json"
+        path = f"{HF_RESULTS_DIR}/{_safe(payload['name'])}.json"
         api.upload_file(path_or_fileobj=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                         path_in_repo=path, repo_id=repo, repo_type="dataset",
                         commit_message=f"rp_ab_test: {payload['name']}")
@@ -851,12 +1153,12 @@ def _():
 
 
     def hf_pull_results():
-        """Ambil semua results/*.json dari dataset HF. Return dict {name: payload}."""
+        """Ambil semua <HF_RESULTS_DIR>/*.json dari dataset HF. Return dict {name: payload}."""
         from huggingface_hub import HfApi, hf_hub_download
 
         repo, token = os.environ["RP_HF_RESULTS_REPO"], os.environ["HF_TOKEN"]
         files = [f for f in HfApi(token=token).list_repo_files(repo, repo_type="dataset")
-                 if f.startswith("results/") and f.endswith(".json")]
+                 if f.startswith(HF_RESULTS_DIR + "/") and f.endswith(".json")]
         out = {}
         for f in files:
             p = hf_hub_download(repo, f, repo_type="dataset", token=token, force_download=True)
@@ -969,6 +1271,7 @@ def _():
         flags = [f for _, t in turns for f in t["analysis"]["flags"]]
         lat = [t["latency"] for _, t in turns]
         tps = [t["tokens"] / t["latency"] for _, t in turns if t.get("tokens") and t["latency"] > 0]
+        think = [t["think_tokens"] for _, t in turns if t.get("think_tokens") is not None]
         by_scene = {}
         for s, t in turns:
             by_scene.setdefault(s, []).append(t["analysis"]["score"])
@@ -986,6 +1289,9 @@ def _():
             "refusal": flags.count("REFUSAL"), "lecture": flags.count("LECTURE"),
             "frag": flags.count("FRAGMENTED"), "loop": flags.count("LOOP"),
             "trunc": flags.count("TRUNCATED"), "leak": flags.count("THINK_LEAK"), "empty": flags.count("EMPTY"),
+            "runaway": flags.count("THINK_RUNAWAY"),
+            "think": round(statistics.mean(think)) if think else None,
+            "think_max": max(think) if think else None,
             "lat": round(statistics.mean(lat), 1), "tps": round(statistics.mean(tps), 1) if tps else None,
             "by_scene": {k: round(statistics.mean(v), 2) for k, v in by_scene.items()},
             "drift": drift, "errors": errors,
@@ -1011,10 +1317,12 @@ def _():
         lines.append(md_table(
             [[i + 1, n, s["avg"], s.get("ci", "-"), f"{wr.get(n)}%" if wr.get(n) is not None else "-", s.get("min"),
               f"{s.get('pass')}%", s.get("n"), s.get("refusal"), s.get("lecture"), s.get("frag"), s.get("loop"),
-              s.get("trunc"), s.get("leak"), s.get("drift"), s.get("lat"), s.get("tps"), s["errors"]]
+              s.get("trunc"), s.get("runaway"), s.get("leak"), s.get("think"), s.get("think_max"), s.get("drift"),
+              s.get("lat"), s.get("tps"), s["errors"]]
              for i, (n, s) in enumerate((n, sums[n]) for n in ranked)],
             ["#", "model", "rata2", "CI95", "win-rate", "min", "lulus>=8", "n item", "refusal", "ceramah", "fragmen",
-             "loop", "terpotong", "bocor-think", "drift(awal-akhir)", "detik/resp", "tok/s", "error"]))
+             "loop", "terpotong", "habis-di-think", "bocor-think", "token think rata2", "token think maks",
+             "drift(awal-akhir)", "detik/resp", "tok/s", "error"]))
         if pairs:
             lines += ["\n## Head-to-head (item berpasangan: scene, run, giliran sama)\n",
                       md_table([[r["a"], r["b"], r["n"], r["win_a"], r["tie"], r["win_b"], r["mean_diff"],
@@ -1030,6 +1338,8 @@ def _():
                      f"- Seri = selisih skor <= {TIE_EPS}. `win-rate` = (menang + seri/2) / n, dirata-rata atas semua lawan.\n"
                      "- 'beda nyata' butuh p < 0.05 DAN CI95 selisih tidak melewati 0. Dengan 1 run per scene, "
                      "n terlalu kecil: pakai >= 3 run.\n"
+                     "- `token think` = completion_tokens dikurangi token jawaban (dihitung lewat /tokenize). "
+                     "`habis-di-think` = max_tokens habis saat berpikir sehingga jawaban kosong/kurang dialog.\n"
                      "- Skor otomatis hanya mengukur format/bahasa/refusal. Kealamian Indonesia, tata bahasa Jerman, "
                      "dan kualitas prosa dinilai lewat judge_packet.md.")
         report = "\n".join(lines)
@@ -1083,7 +1393,7 @@ def _():
         return (md_table([[i + 1, *r] for i, r in enumerate(rows)],
                          ["#", "model", "skor otomatis", "skor Claude (0-10)", "FINAL"])
                 + f"\n\nFINAL = {auto_weight:.0%} otomatis + {1 - auto_weight:.0%} penilaian Claude")
-    return (argparse, fnmatch, json, math, os, random, re, shlex, shutil, signal, socket, statistics, subprocess, sys, tarfile, time, datetime, Path, requests, DETECTOR, detect, SYSTEM_PROMPT, SCENES, JUDGE_CRITERIA, QUOTE_MAP, Q_RE, PAREN_RE, SENT_SPLIT, ELLIPSIS_EDGE, REFUSAL_RE, LECTURE_RE, wc, clean_text, analyze, MOCK_OUTPUTS, chat, run_scene, LLAMA_DIR, WORK_DIR, gpu_info, pick_llama_assets, ensure_llama_server, build_cmd, start_server, wait_ready, stop_server, model_cache_dir, can_prefetch, gguf_size_gb, fetch_gguf, Prefetcher, expand_variants, execute_model, disk_free_gb, hf_results_enabled, hf_push_payload, hf_pull_results, parse_results_json, item_scores, bootstrap_ci, sign_test_p, pairwise, win_rates, label_for, all_turns, summarize, md_table, build_report, final_table,)
+    return (argparse, fnmatch, json, math, os, random, re, shlex, shutil, signal, socket, statistics, subprocess, sys, tarfile, time, datetime, Path, requests, DETECTOR, detect, SYSTEM_PROMPT, SCENES, JUDGE_CRITERIA, QUOTE_MAP, Q_RE, PAREN_RE, SENT_SPLIT, ELLIPSIS_EDGE, REFUSAL_RE, LECTURE_RE, wc, clean_text, analyze, MOCK_OUTPUTS, chat, count_tokens, think_token_count, run_scene, LLAMA_DIR, WORK_DIR, gpu_info, pick_llama_assets, ensure_llama_server, build_cmd, start_server, wait_ready, stop_server, vram_free_gb, GpuGate, server_args, model_cache_dir, can_prefetch, gguf_size_gb, fetch_gguf, Prefetcher, expand_variants, execute_model, disk_free_gb, payload_matches, already_done, run_batch, HF_RESULTS_DIR, hf_results_enabled, hf_push_payload, hf_pull_results, parse_results_json, item_scores, bootstrap_ci, sign_test_p, pairwise, win_rates, label_for, all_turns, summarize, md_table, build_report, final_table,)
 
 
 @app.cell(hide_code=True)
@@ -1117,6 +1427,9 @@ def _(mo, DETECTOR):
     5. Hasil antar sesi: unduh `results.json` lalu unggah lagi di bagian 0, **atau** isi secret `HF_TOKEN` +
        `RP_HF_RESULTS_REPO` (mis. `namamu/rp-ab-results`) supaya tiap varian otomatis diunggah ke dataset HF privat.
     6. Unduh `judge_packet.md`, kirim ke Claude, lalu tempel JSON penilaian di bagian akhir.
+    7. Default: 4 run, `max_tokens` 16384 dengan thinking nyala (batas thinking 12288 token), KV cache q8_0,
+       dan 2 model bersamaan kalau VRAM cukup (dicek lewat `nvidia-smi`; kalau tidak cukup, bergantian).
+       Sesi 12 jam tidak cukup untuk 16 model sekaligus: jalankan per preset, hasil otomatis dilewati di sesi berikutnya.
 
     Coba dulu dengan **model demo** (`"base_url": "mock"`) untuk memastikan semuanya jalan.
     """)
@@ -1144,7 +1457,8 @@ def _(disk_free_gb, gpu_info, hf_results_enabled, mo):
 @app.cell(hide_code=True)
 def _(json, mo):
     # Semua repo & nama file dicek lewat API Hugging Face (26 Nov 2026): ada, tidak gated, ukuran Q6_K tertera.
-    _QWEN = {"max_tokens": 1500, "extra": {"chat_template_kwargs": {"enable_thinking": False}}}
+    # Thinking & max_tokens diatur seragam lewat form (bagian 2), tidak lagi per model.
+    _QWEN = {}
 
     def _gg(name, repo, file, gb, note, **kw):
         return {"name": name, "launch": {"backend": "llama.cpp", "hf": repo, "hf_file": file},
@@ -1190,14 +1504,18 @@ def _(json, mo):
             "40B DavidAU, kuantisasi imatrix NEO", **_QWEN),
     ]
     _CMP = [
-        _gg("mistral-small-3.2-24b-heretic", "llmfan46/Mistral-Small-3.2-24B-Instruct-2506-ultra-uncensored-heretic-GGUF",
-            "Mistral-Small-3.2-24B-Instruct-2506-ultra-uncensored-heretic-Q6_K.gguf", 19.3, "Mistral lama, ringan"),
         _gg("qwen-sea-lion-v5-27b", "aisingapore/Qwen-SEA-LION-v5-27B-GGUF", "Qwen-SEA-LION-v5-27B-Q6_K.gguf", 22.4,
             "tolok ukur bahasa Indonesia, BUKAN uncensored (scene gelap bisa menolak)", **_QWEN),
-        # 119B MoE: Q4_K_M 72.2GB -> sisa VRAM sedikit, jadi 1 slot dan ctx 16k (8k terlalu pendek untuk long_session)
+    ]
+    # Dibuang dari "Semua" setelah run 26 Nov 2026 (judge: Mistral 3.2 5.5/10, Mistral 4 6.1/10).
+    # Disimpan di preset "Arsip" kalau ingin dites ulang.
+    _ARSIP = [
+        _gg("mistral-small-3.2-24b-heretic", "llmfan46/Mistral-Small-3.2-24B-Instruct-2506-ultra-uncensored-heretic-GGUF",
+            "Mistral-Small-3.2-24B-Instruct-2506-ultra-uncensored-heretic-Q6_K.gguf", 19.3, "Mistral lama, ringan"),
+        # 119B MoE: Q4_K_M 72.2GB -> memenuhi VRAM, jadi 1 slot dan selalu dimuat sendirian
         {"name": "mistral-small-4-119b-heretic",
          "launch": {"backend": "llama.cpp", "hf": "Rioky/Mistral-Small-4-119B-2603-heretic-gguf",
-                    "hf_file": "Mistral-Small-4-119B-2603-heretic-Q4_K_M.gguf", "ctx": 16384, "parallel": 1},
+                    "hf_file": "Mistral-Small-4-119B-2603-heretic-Q4_K_M.gguf", "ctx": 24576, "parallel": 1},
          "note": "119B MoE heretic | Q4_K_M 72.2 GB, butuh disk >= 80GB"},
     ]
     _DEMO = [
@@ -1212,8 +1530,9 @@ def _(json, mo):
         "Batch 1 (5 model)": _B1,
         "Batch 2 (5 merge Gemma)": _B2,
         "Qwen3.8 27B + 40B (6 model)": _QW,
-        "Pembanding: Mistral + SEA-LION (3 model)": _CMP,
+        "Pembanding: SEA-LION (1 model)": _CMP,
         f"Semua ({len(_all)} model)": list(_all.values()),
+        "Arsip: Mistral 3.2 + Mistral 4 119B (dibuang)": _ARSIP,
     }
 
     def preset_json(key):
@@ -1241,9 +1560,8 @@ def _(mo, preset, preset_json):
   {"name": "qwen38-27b-abliterated",
    "launch": {"backend": "llama.cpp", "hf": "huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF",
               "hf_file": "Huihui-Qwen3.8-27B-abliterated-Q6_K.gguf", "ctx": 32768},
-   "max_tokens": 1500, "extra": {"chat_template_kwargs": {"enable_thinking": false}},
-   "variants": [{"suffix": "t0.8"},
-                {"suffix": "vendor", "temperature": 0.7, "top_p": 0.8, "extra": {"top_k": 20, "min_p": 0}}]},
+   "variants": [{"suffix": "think"},
+                {"suffix": "nothink", "extra": {"chat_template_kwargs": {"enable_thinking": false}}}]},
   {"name": "gemma4-31b-vllm",
    "launch": {"backend": "command", "cmd": "vllm serve google/gemma-4-31B-it --port {port} --max-model-len 32768"},
    "model": "google/gemma-4-31B-it"},
@@ -1261,11 +1579,12 @@ def _(mo, preset, preset_json):
             "Q8_0 32.6GB; Qwen3.8 Q6_K 22.4GB, Q8_0 29.0GB. Repo Qwen juga punya `Q6_K_L`, `UD-*`, `-mtp`, "
             "jadi nama persis lebih aman dari tag `:Q6_K`.\n"
             "- File mmproj (vision) tidak diunduh (`--no-mmproj`). Set `\"mmproj\": true` di `launch` kalau perlu.\n"
-            "- `ctx` 32768: sesi panjang 10 giliran x ~1200 token bisa melewati 16k. VRAM 96GB cukup.\n"
-            "- Varian `vendor` = sampler rekomendasi umum keluarga model (Gemma: temp 1.0/top_k 64; Qwen non-thinking: "
-            "temp 0.7/top_p 0.8/top_k 20). Varian tanpa override memakai slider di form.\n"
-            "- Backend `command` memakai perintah apa pun yang kamu pasang sendiri (mis. vLLM); `{port}` diisi otomatis.\n"
-            "- Qwen: `enable_thinking=false` supaya token tidak habis untuk berpikir.")}),
+            "- `ctx` per slot otomatis dinaikkan ke `max_tokens + 8192` kalau lebih kecil (thinking ikut makan konteks).\n"
+            "- Varian `vendor` = sampler rekomendasi umum keluarga model (Gemma: temp 1.0/top_k 64). "
+            "Varian tanpa override memakai slider di form.\n"
+            "- Thinking diatur di form untuk semua model. Varian `nothink` (contoh Qwen di atas) mematikannya untuk "
+            "satu varian saja, jadi efek thinking bisa dibandingkan di server yang sama.\n"
+            "- Backend `command` memakai perintah apa pun yang kamu pasang sendiri (mis. vLLM); `{port}` diisi otomatis.")}),
     ])
     return (models_json,)
 
@@ -1298,9 +1617,19 @@ def _(SCENES, json, mo, models_json):
 
         {max_tokens}
 
+        {thinking}
+
+        {reasoning_budget}
+
+        {concurrency}
+
         {parallel}
 
+        {kv_q8}
+
         {prefetch}
+
+        {resume}
 
         {keep_cache}
         """).batch(
@@ -1308,14 +1637,24 @@ def _(SCENES, json, mo, models_json):
                                      full_width=True),
             scenes=mo.ui.multiselect(options=_scene_ids, value=[_i for _i in _scene_ids if _i != "long_session"],
                                      label="Scene (long_session = 10 giliran, paling lama)", full_width=True),
-            runs=mo.ui.slider(1, 10, value=3, step=1, label="Run per scene (seed beda tiap run, sama antar model)",
+            runs=mo.ui.slider(1, 10, value=4, step=1, label="Run per scene (seed beda tiap run, sama antar model)",
                               show_value=True),
             temperature=mo.ui.slider(0.0, 1.5, value=0.8, step=0.05, label="Temperature", show_value=True),
-            max_tokens=mo.ui.number(start=300, stop=8000, step=100, value=1200, label="max_tokens"),
+            max_tokens=mo.ui.number(start=300, stop=32768, step=512, value=16384,
+                                    label="max_tokens (thinking + jawaban)"),
+            thinking=mo.ui.checkbox(value=True, label="Thinking nyala (enable_thinking=true di semua model lokal)"),
+            reasoning_budget=mo.ui.number(start=-1, stop=32768, step=1024, value=12288,
+                                          label="Batas token thinking (--reasoning-budget; -1 = tanpa batas). "
+                                                "Sisakan >= 4096 untuk jawaban"),
+            concurrency=mo.ui.slider(1, 2, value=2, step=1, show_value=True,
+                                     label="Model bersamaan di GPU (2 = hanya kalau VRAM cukup, dicek otomatis)"),
             parallel=mo.ui.slider(1, 8, value=3, step=1, show_value=True,
                                   label="Slot paralel per model (llama-server -np; KV cache naik sebanding)"),
+            kv_q8=mo.ui.checkbox(value=True, label="KV cache q8_0 (VRAM KV separuh; perlu flash attention)"),
             prefetch=mo.ui.slider(0, 15, value=1, step=1, show_value=True,
                                   label="Unduh model berikutnya di muka (0 = tidak; 15 = semua, kalau disk cukup)"),
+            resume=mo.ui.checkbox(value=True, label="Lewati model yang hasilnya sudah ada dengan setelan sama "
+                                                    "(muat dulu dari HF/file di bagian 0)"),
             keep_cache=mo.ui.checkbox(value=False, label="Simpan unduhan model setelah selesai (butuh disk besar)"),
         ).form(submit_button_label="Jalankan tes", bordered=False)
     )
@@ -1326,26 +1665,37 @@ def _(SCENES, json, mo, models_json):
 @app.cell(hide_code=True)
 def _(mo):
     get_results, set_results = mo.state({})
-    clear_btn = mo.ui.button(label="Kosongkan semua hasil", kind="danger", on_click=lambda _: set_results({}))
-    return clear_btn, get_results, set_results
+    # salinan biasa (bukan state) untuk fitur resume: sel tes membacanya tanpa ikut dijalankan ulang
+    # setiap kali state berubah
+    results_store = {}
+
+    def _clear(_):
+        results_store.clear()
+        set_results({})
+
+    clear_btn = mo.ui.button(label="Kosongkan semua hasil", kind="danger", on_click=_clear)
+    return clear_btn, get_results, results_store, set_results
 
 
 @app.cell(hide_code=True)
-def _(hf_results_enabled, mo):
+def _(HF_RESULTS_DIR, hf_results_enabled, mo):
     prev_file = mo.ui.file(filetypes=[".json"], label="Unggah results.json sesi sebelumnya", kind="area")
     hf_pull_btn = mo.ui.run_button(label="Ambil semua hasil dari dataset HF", disabled=not hf_results_enabled())
     mo.vstack([mo.md("### 0. Lanjutkan dari hasil sebelumnya (opsional)\n"
-                     "Hasil digabung per nama varian; nama yang sama ditimpa versi terbaru."),
+                     "Hasil digabung per nama varian; nama yang sama ditimpa versi terbaru. "
+                     f"Folder HF yang dibaca/ditulis: `{HF_RESULTS_DIR}/` (secret `RP_HF_RESULTS_DIR`). "
+                     "Muat dulu sebelum menekan **Jalankan tes** supaya model yang sudah selesai dilewati."),
                mo.hstack([prev_file, hf_pull_btn], justify="start", align="center")])
     return hf_pull_btn, prev_file
 
 
 @app.cell(hide_code=True)
-def _(hf_pull_btn, hf_pull_results, mo, parse_results_json, prev_file, set_results):
+def _(hf_pull_btn, hf_pull_results, mo, parse_results_json, prev_file, results_store, set_results):
     _msgs = []
     if prev_file.value:
         try:
             _loaded = parse_results_json(prev_file.contents())
+            results_store.update(_loaded)
             set_results(lambda _prev: {**_prev, **_loaded})
             _msgs.append(f"Dimuat dari file: {len(_loaded)} varian ({', '.join(sorted(_loaded))}).")
         except Exception as _e:
@@ -1353,6 +1703,7 @@ def _(hf_pull_btn, hf_pull_results, mo, parse_results_json, prev_file, set_resul
     if hf_pull_btn.value:
         try:
             _pulled = hf_pull_results()
+            results_store.update(_pulled)
             set_results(lambda _prev: {**_prev, **_pulled})
             _msgs.append(f"Dimuat dari HF: {len(_pulled)} varian ({', '.join(sorted(_pulled))}).")
         except Exception as _e:
@@ -1362,8 +1713,8 @@ def _(hf_pull_btn, hf_pull_results, mo, parse_results_json, prev_file, set_resul
 
 
 @app.cell(hide_code=True)
-def _(Path, Prefetcher, SCENES, argparse, can_prefetch, execute_model, expand_variants, fetch_gguf, form,
-      hf_push_payload, json, mo, model_cache_dir, models_cfg, set_results, shutil):
+def _(Path, SCENES, already_done, argparse, expand_variants, form, hf_push_payload, json, mo, models_cfg,
+      results_store, run_batch, set_results):
     mo.stop(form.value is None, mo.md("_Pilih model & scene lalu tekan **Jalankan tes**._"))
     _cfg = form.value
     _sel = [_m for _m in models_cfg if _m["name"] in _cfg["models"]]
@@ -1371,14 +1722,28 @@ def _(Path, Prefetcher, SCENES, argparse, can_prefetch, execute_model, expand_va
     _by_id = {_s["id"]: _s for _s in SCENES}
     _scenes = [_by_id[_i] for _i in _cfg["scenes"]]
     mo.stop(not _scenes, mo.md("**Pilih minimal satu scene.**"))
+    _think = bool(_cfg["thinking"])
+    # timeout per permintaan: 16K token pada ~12 tok/s (2 model + 3 slot berbagi GPU) ~ 23 menit
     _ns = argparse.Namespace(temperature=_cfg["temperature"], top_p=0.95,
-                             max_tokens=int(_cfg["max_tokens"]), timeout=900, seed=1000,
-                             parallel=int(_cfg["parallel"]))
+                             max_tokens=int(_cfg["max_tokens"]), timeout=2400, seed=1000,
+                             parallel=int(_cfg["parallel"]), thinking=_think,
+                             reasoning_budget=int(_cfg["reasoning_budget"]) if _think else 0,
+                             kv_q8=bool(_cfg["kv_q8"]))
     _runs = int(_cfg["runs"])
     _keep = bool(_cfg["keep_cache"])
+    batch_log = []
+    _scene_ids = [_s["id"] for _s in _scenes]
+    if _cfg["resume"]:
+        _skip = [_m["name"] for _m in _sel if already_done(_m, results_store, _runs, _scene_ids, _ns)]
+        if _skip:
+            batch_log.append(f"Dilewati (hasil dengan setelan sama sudah ada): {', '.join(_skip)}")
+        _sel = [_m for _m in _sel if _m["name"] not in _skip]
     _per_variant = len(_scenes) * _runs
-    _total = sum(len(expand_variants(_m)) for _m in _sel) * _per_variant
-    _new, batch_log = {}, []
+    _n_items = {_m["name"]: len(expand_variants(_m)) * _per_variant for _m in _sel}
+    _total = max(1, sum(_n_items.values()))
+    _new = {}
+    _steps = {_m["name"]: 0 for _m in _sel}
+    _last = {}
 
     def _save_local():
         try:
@@ -1386,54 +1751,35 @@ def _(Path, Prefetcher, SCENES, argparse, can_prefetch, execute_model, expand_va
         except Exception:
             pass
 
-    def _variant_done(p):
-        # simpan segera per varian: kalau sesi mati di tengah, varian yang selesai tidak hilang
-        _new[p["name"]] = p
-        _save_local()
-        try:
-            _path = hf_push_payload(p)
-            if _path:
-                batch_log.append(f"Diunggah ke HF: {_path}")
-        except Exception as _e:
-            batch_log.append(f"Gagal unggah HF ({p['name']}): {type(_e).__name__}: {_e}")
-        # tampilkan hasil yang sudah selesai walau model berikutnya belum jalan
-        set_results(lambda _prev, _p=p: {**_prev, _p["name"]: _p})
-
-    with mo.status.progress_bar(total=_total, title="Menjalankan tes") as _bar:
-        _pf = Prefetcher(_sel, depth=int(_cfg["prefetch"]), keep_cache=_keep,
-                         log=lambda msg: batch_log.append(str(msg)))
-        try:
-            for _idx, _m in enumerate(_sel):
-                _done = [0]
-                _n_var = len(expand_variants(_m))
-
-                def _log(msg, _name=_m["name"]):
-                    _bar.update(increment=0, title=_name, subtitle=str(msg)[:200])
-
-                def _step(name, scene, i, res, _done=_done):
-                    _done[0] += 1
-                    _bar.update(increment=1, title=name, subtitle=f"{scene} run{i + 1}")
-
-                try:
-                    # 1) GGUF model ini: dari prefetch, atau unduh sekarang (sebelum prefetch berikutnya mulai,
-                    #    supaya dua unduhan tidak berebut bandwidth)
-                    _path = _pf.take(_idx)
-                    if _path is None and can_prefetch(_m):
-                        _path = fetch_gguf(_m, _log)
-                    # 2) mulai unduh model berikutnya di latar belakang selagi model ini dites
-                    _pf.schedule(_idx)
-                    # 3) tes
-                    _payloads = execute_model(_m, _scenes, _runs, _ns, log=_log, step=_step, keep_cache=_keep,
-                                              ready_timeout=3600, on_variant_done=_variant_done, model_path=_path)
-                    batch_log.append(f"OK: {', '.join(_p['name'] for _p in _payloads)}")
-                except Exception as _e:
-                    _msg = f"{type(_e).__name__}: {_e}"
-                    batch_log.append(f"GAGAL: {_m['name']} -> {_msg[:300]}")
-                    _bar.update(increment=max(0, _n_var * _per_variant - _done[0]))
-                    if not _keep:
-                        shutil.rmtree(model_cache_dir(_m["name"]), ignore_errors=True)
-        finally:
-            _pf.close()
+    if _sel:
+        # semua update UI terjadi di thread sel ini; pekerja (unduh, server, permintaan) jalan di thread lain
+        with mo.status.progress_bar(total=_total, title="Menjalankan tes") as _bar:
+            for _ev in run_batch(_sel, _scenes, _runs, _ns, concurrency=int(_cfg["concurrency"]),
+                                 prefetch=int(_cfg["prefetch"]), keep_cache=_keep, push=hf_push_payload):
+                _kind = _ev[0]
+                if _kind == "log":
+                    _last[_ev[1]] = _ev[2]
+                    _bar.update(increment=0, title=_ev[1], subtitle=" | ".join(
+                        f"{_k}: {_v}" for _k, _v in list(_last.items())[-2:])[:240])
+                elif _kind == "step":
+                    _steps[_ev[1]] += 1
+                    _bar.update(increment=1, title=_ev[2], subtitle=_ev[3])
+                elif _kind == "variant":
+                    _p, _info = _ev[1], _ev[2]
+                    # simpan segera per varian: kalau sesi mati di tengah, varian yang selesai tidak hilang
+                    _new[_p["name"]] = _p
+                    results_store[_p["name"]] = _p
+                    _save_local()
+                    if _info:
+                        batch_log.append(_info if _info.startswith("Gagal") else f"Diunggah ke HF: {_info}")
+                    set_results(lambda _prev, _p=_p: {**_prev, _p["name"]: _p})
+                elif _kind == "done":
+                    _name, _ok, _info = _ev[1], _ev[2], _ev[3]
+                    if _ok:
+                        batch_log.append(f"OK: {_info}")
+                    else:
+                        batch_log.append(f"GAGAL: {_name} -> {_info}")
+                        _bar.update(increment=max(0, _n_items[_name] - _steps[_name]))
     mo.md("**Selesai.**\n\n" + "\n".join(f"- {_x}" for _x in batch_log))
     return (batch_log,)
 
